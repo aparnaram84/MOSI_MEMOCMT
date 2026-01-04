@@ -1,135 +1,145 @@
 import os
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_curve, auc
 from modules.data_loader import load_segmented_data
 from modules.feature_extractors import MultiModalFeatureExtractor
 from modules.model_cmt import CrossModalTransformer
 
-def parse_transcript(text_path):
-    """
-    Parses raw text from the .annotprocessed files.
-    
-    Input:
-        text_path (str): Absolute path to a .annotprocessed file.
-    Output:
-        raw_text (str): Cleaned transcription string for the BERT encoder.
-    """
+def robust_parse_transcript(base_dir, vid_id):
+    """Parses actual segment text to provide variance for BERT embeddings."""
     try:
-        with open(text_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            # Extracts the semantic meaning as per slide 154
-            return content.split(' ')[-1] if ' ' in content else content
-    except FileNotFoundError:
-        return ""
+        parent_id, seg_num = vid_id.rsplit('_', 1)
+        internal_prefix = f"{seg_num}_"
+    except ValueError: return "neutral", False
+    
+    path = os.path.join(base_dir, "Raw", "Transcript", "Segmented", f"{parent_id}.annotprocessed")
+    if os.path.exists(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith(internal_prefix):
+                    return (line.strip().split(' ')[-1] if ' ' in line else line.strip()), True
+    return "neutral", False
+
+def plot_binary_visuals(y_true, y_pred, y_probs, attn_list, title):
+    """Generates visualizations with explicitly labeled axes."""
+    # 1. Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(5,4))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Neg', 'Pos'], yticklabels=['Neg', 'Pos'])
+    plt.title(f"Confusion Matrix: {title}")
+    plt.xlabel("Predicted Sentiment Class"); plt.ylabel("True Sentiment Class")
+    plt.show()
+
+    # 2. ROC Curve
+    fpr, tpr, _ = roc_curve(y_true, y_probs)
+    plt.figure(figsize=(5,4))
+    plt.plot(fpr, tpr, label=f'AUC = {auc(fpr, tpr):.2f}')
+    plt.plot([0,1], [0,1], 'k--')
+    plt.title(f"ROC Curve: {title}")
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.legend(); plt.show()
+
+    # 3. Cross-Modal Attention Bar Chart
+    avg_attn = np.mean(np.vstack(attn_list), axis=0)
+    plt.figure(figsize=(6,4))
+    sns.barplot(x=['Text', 'Audio', 'Visual'], y=avg_attn, hue=['Text', 'Audio', 'Visual'], palette='viridis', legend=False)
+    plt.title(f"Modality Attention Importance: {title}")
+    plt.xlabel("Input Modality Type"); plt.ylabel("Attention Weight (Relative Importance)")
+    plt.show()
 
 def train():
-    """
-    Main training and validation pipeline for the Affective Computing project.
-    
-    Logic Flow:
-    1. Load segment IDs and Ground Truth labels.
-    2. Extract Triple-stream features (A, V, T).
-    3. Fuse features using Cross-Modal Transformer (CMT).
-    4. Validate using sentiment scores and calculate metrics.
-    """
-    print("--- Starting Multimodal Affective Computing Training & Validation ---")
-    
-    # PROJECT CONFIGURATION
-    # DATA_PATH: Root directory containing Raw/ folder
+    print("--- Starting Binary Pipeline with Full Per-Epoch Metrics ---")
     DATA_PATH = r"C:\Aparna\BITS_MTech_AIML\Sem4\mosi_memocmt\data"
-    # LABEL_PATH: CSV containing mapping of segment_id to -3/+3 sentiment scores [cite: 196, 213]
-    LABEL_PATH = os.path.join(DATA_PATH, "labels.csv")
-    
-    if not os.path.exists(LABEL_PATH):
-        print(f"Error: {LABEL_PATH} not found. Please run label generator first.")
-        return
-        
-    # Load labels into a DataFrame for O(1) lookup during training
-    labels_df = pd.read_csv(LABEL_PATH).set_index('segment_id')
-    
-    # STEP 1: DATA SPLITS [cite: 12]
-    # Input: DATA_PATH
-    # Output: Lists of unique segment IDs (e.g., 'video1_1')
+    labels_df = pd.read_csv(os.path.join(DATA_PATH, "labels.csv")).set_index('segment_id')
     train_ids, test_ids = load_segmented_data(DATA_PATH)
     
-    # STEP 2: INITIALIZE FEATURE EXTRACTORS [cite: 144-145]
-    # Input: Raw paths or strings
-    # Output: Projected 256D Tensors
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CrossModalTransformer().to(device)
     extractor = MultiModalFeatureExtractor()
-    
-    # STEP 3: INITIALIZE CROSS-MODAL TRANSFORMER [cite: 160, 186]
-    # Input: Fused token tensor [Batch, 3, 256]
-    # Output: Sentiment regression score (1D)
-    cmt_model = CrossModalTransformer()
-    
-    all_preds = []
-    all_ground_truth = []
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-2)
 
-    # Processing first 25 samples for verification of the architecture flow
-    print(f"Validation: Processing {len(train_ids[:100])} segments.")
-
-    for vid_id in train_ids[:25]:
-        if vid_id not in labels_df.index:
-            continue
+    for epoch in range(5):
+        model.train()
+        tr_losses, tr_y, tr_p = [], [], []
+        print(f"\n--- Epoch {epoch+1} ---")
+        
+        for vid_id in train_ids[:150]:
+            if vid_id not in labels_df.index: continue
+            txt, found = robust_parse_transcript(DATA_PATH, vid_id)
+            audio_p = os.path.join(DATA_PATH, "Raw/Audio/WAV_16000/Segmented", f"{vid_id}.wav")
+            video_p = os.path.join(DATA_PATH, "Raw/Video/Segmented", f"{vid_id}.mp4")
             
-        # Define Absolute Paths for the three modalities
-        audio_p = os.path.join(DATA_PATH, "Raw/Audio/WAV_16000/Segmented", f"{vid_id}.wav")
-        video_p = os.path.join(DATA_PATH, "Raw/Video/Segmented", f"{vid_id}.mp4")
-        text_p = os.path.join(DATA_PATH, "Raw/Transcript/Segmented", f"{vid_id}.annotprocessed")
+            if not (os.path.exists(audio_p) and os.path.exists(video_p) and found): continue
 
-        # --- FEATURE EXTRACTION (TRIPLE-STREAM) ---
+            try:
+                # Real-time extraction with variance
+                t_f = extractor.get_text_features(txt).to(device)
+                a_f = extractor.get_audio_features(audio_p).to(device)
+                v_f = extractor.get_visual_features(video_p).to(device)
+                fused = torch.stack([t_f, a_f, v_f], dim=1)
+                
+                optimizer.zero_grad()
+                logits, _ = model(fused)
+                target_score = labels_df.loc[vid_id, 'sentiment']
+                target_bin = torch.tensor([[1.0 if target_score > 0 else 0.0]]).to(device)
+                
+                loss = criterion(logits, target_bin); loss.backward(); optimizer.step()
+                tr_losses.append(loss.item()); tr_y.append(int(target_bin.item()))
+                tr_p.append(1 if torch.sigmoid(logits).item() > 0.5 else 0)
+            except Exception: continue
         
-        # A. Text Stream [cite: 154-157]
-        # Input: String (e.g. "I am happy") 
-        # Output: [1, 256] Dimension BERT embedding
-        raw_text = parse_transcript(text_p)
-        t_feat = extractor.get_text_features(raw_text) 
-
-        # B. Audio Stream [cite: 146-149]
-        # Input: Path to 16kHz WAV file
-        # Output: [1, 256] Dimension HuBERT embedding (prosody & tone)
-        a_feat = extractor.get_audio_features(audio_p) 
-
-        # C. Visual Stream [cite: 150-153]
-        # Input: Path to MP4 file
-        # Output: [1, 256] Dimension ResNet embedding (facial expressions)
-        v_feat = extractor.get_visual_features(video_p) 
-
-        # STEP 4: TOKEN-LEVEL FUSION [cite: 133-134, 175]
-        # Logic: Stack the three 256D vectors to create a sequence of tokens
-        # Input Dimension: 3 x [1, 256]
-        # Output Dimension: [1, 3, 256] (where 3 represents A, V, and T tokens)
-        fused_input = torch.stack([t_feat, a_feat, v_feat], dim=1)
+        # Validation Loop Per Epoch
+        model.eval()
+        va_losses, va_y, va_p = [], [], []
+        with torch.no_grad():
+            for vid_id in test_ids[:40]:
+                if vid_id not in labels_df.index: continue
+                txt_v, found_v = robust_parse_transcript(DATA_PATH, vid_id)
+                # (Extraction logic same as train)
+                try:
+                    f_v = torch.stack([extractor.get_text_features(txt_v).to(device), 
+                                       extractor.get_audio_features(audio_p).to(device), 
+                                       extractor.get_visual_features(video_p).to(device)], dim=1)
+                    v_logits, _ = model(f_v)
+                    v_target = torch.tensor([[1.0 if labels_df.loc[vid_id, 'sentiment'] > 0 else 0.0]]).to(device)
+                    va_losses.append(criterion(v_logits, v_target).item())
+                    va_y.append(int(v_target.item())); va_p.append(1 if torch.sigmoid(v_logits).item() > 0.5 else 0)
+                except Exception: continue
         
-        # STEP 5: CMT PREDICTION [cite: 161-164, 189]
-        # Learns deep cross-modal relationships via Multi-head attention
-        prediction = cmt_model(fused_input).item()
-        
-        #best_id = get_best_match(vid_id, labels_df.index)
-        #if best_id:
-        #ground_truth = labels_df.loc[best_id, 'sentiment']
+        if tr_y:
+            print(f"Epoch {epoch+1} | Train Loss: {np.mean(tr_losses):.4f} | Train Acc: {accuracy_score(tr_y, tr_p)*100:.2f}%")
+            print(f"Epoch {epoch+1} | Val Loss: {np.mean(va_losses):.4f} | Val Acc: {accuracy_score(va_y, va_p)*100:.2f}% | Val F1: {f1_score(va_y, va_p):.4f}")
 
-        # Retrieve Ground Truth [cite: 196]
-        ground_truth = labels_df.loc[vid_id, 'sentiment']
-        
-        all_preds.append(prediction)
-        all_ground_truth.append(ground_truth)
-        
-        print(f"Segment {vid_id} | Aligned Dim: [3, 256] | Pred: {prediction:.2f} | Real: {ground_truth:.2f}")
+    # --- FINAL TEST EVALUATION ---
+    print("\n--- FINAL TEST LOGS (Actual Scores vs Binary Classification) ---")
+    te_y, te_p, te_prob, te_attn = [], [], [], []
+    with torch.no_grad():
+        for vid_id in test_ids[40:60]:
+            if vid_id not in labels_df.index: continue
+            try:
+                txt_t, _ = robust_parse_transcript(DATA_PATH, vid_id)
+                f_t = torch.stack([extractor.get_text_features(txt_t).to(device), 
+                                   extractor.get_audio_features(audio_p).to(device), 
+                                   extractor.get_visual_features(video_p).to(device)], dim=1)
+                logits, attn = model(f_t)
+                prob = torch.sigmoid(logits).item()
+                actual_true_score = labels_df.loc[vid_id, 'sentiment']
+                
+                # PRINT ACTUAL SCORES
+                print(f"ID: {vid_id} | True Score: {actual_true_score:+.2f} | Pred Logit: {logits.item():+.2f} | Class: {1 if prob > 0.5 else 0} | Prob: {prob:.4f}")
+                
+                te_prob.append(prob); te_y.append(1 if actual_true_score > 0 else 0)
+                te_p.append(1 if prob > 0.5 else 0); te_attn.append(attn.cpu().numpy())
+            except Exception: continue
 
-    # STEP 6: METRIC EVALUATION [cite: 13, 203-207]
-    # Logic: Convert continuous scores (-3 to +3) to binary classes
-    y_pred = [1 if p > 0 else 0 for p in all_preds]
-    y_true = [1 if g > 0 else 0 for g in all_ground_truth]
-    
-    acc = accuracy_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred, average='weighted')
-
-    print("\n--- Final Performance Metrics ---")
-    print(f"Accuracy: {acc * 100:.2f}% (Binary Sentiment Recognition)")
-    print(f"F1-Score: {f1:.4f} (Weighted average recall)")
-    print("--- Training Pipeline Complete ---")
+    if te_y: plot_binary_visuals(te_y, te_p, te_prob, te_attn, "Final Test Results")
 
 if __name__ == "__main__":
     train()
